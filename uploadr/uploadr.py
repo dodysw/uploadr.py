@@ -312,10 +312,13 @@ class Uploadr:
             self.authenticate()
         self.uploaded = shelve.open( HISTORY_FILE )
         for i, image in enumerate( newImages ):
-            success = self.uploadImage( image )
-            if args.drip_feed and success and i != len( newImages )-1:
-                print("Waiting " + str(DRIP_TIME) + " seconds before next upload")
-                time.sleep( DRIP_TIME )
+            success, photoId = self.uploadImage( image )
+            if success:
+                if args.sets:
+                    self.addPhotoToSet( photoId, args.sets )
+                if args.drip_feed and i != len( newImages )-1:
+                    print("Waiting " + str(DRIP_TIME) + " seconds before next upload")
+                    time.sleep( DRIP_TIME )
         self.uploaded.close()
 
     def grabNewImages( self ):
@@ -339,6 +342,7 @@ class Uploadr:
         """
 
         success = False
+        photoId = 0
         if ( not self.uploaded.has_key( image ) ):
             print("Uploading " + image + "...")
             try:
@@ -366,6 +370,7 @@ class Uploadr:
                 xml = urllib2.urlopen( url ).read()
                 res = xmltramp.parse(xml)
                 if ( self.isGood( res ) ):
+                    photoId = str( res.photoid )
                     print("Success.")
                     self.logUpload( res.photoid, image )
                     success = True
@@ -374,6 +379,33 @@ class Uploadr:
                     self.reportError( res )
             except:
                 print(str(sys.exc_info()))
+        return success, photoId
+
+    def addPhotoToSet( self, photoId, setId ):
+        """ add image to a set
+        """
+
+        success = False
+        print("Adding " + photoId + " to set# " + setId + "...")
+        d = {
+            api.token       : str(self.token),
+            api.perms       : str(self.perms),
+            api.method      : "flickr.photosets.addPhoto",
+            "photoset_id"   : args.sets,
+            "photo_id"      : photoId,
+        }
+        sig = self.signCall( d )
+        url = self.urlGen( api.rest, d, sig )
+        try:
+            res = self.getResponse( url )
+            if ( self.isGood( res ) ):
+                success = True
+                print("Success.")
+            else :
+                print("Problem:")
+                self.reportError( res )
+        except:
+            print(str(sys.exc_info()))
         return success
 
     def logUpload( self, photoID, imageName ):
@@ -480,6 +512,8 @@ if __name__ == "__main__":
         help='Description for uploaded images')
     parser.add_argument('-t', '--tags',        action='store',
         help='Space-separated tags for uploaded images')
+    parser.add_argument('-s', '--sets',        action='store',
+        help='Photo set ID to add the photo into')
     parser.add_argument('-r', '--drip-feed',   action='store_true',
         help='Wait a bit between uploading individual images')
     args = parser.parse_args()
