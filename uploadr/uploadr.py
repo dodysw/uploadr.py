@@ -29,6 +29,8 @@
 
    You may use this code however you see fit in any form whatsoever.
 
+   July 2013 Dody Suria Wijaya - upload is now performed asynchronously.
+
 
 """
 
@@ -75,6 +77,10 @@ SLEEP_TIME = 1 * 60
 #
 DRIP_TIME = 1 * 60
 #
+#   Check tickets status every X uploads. Depending photo size, tt takes 
+#   roughly 2-5 seconds for Flickr to parse uploaded photo. 
+TICKET_CHECK_EVERY = 5
+#
 #   File we keep the history of uploaded images in.
 #
 HISTORY_FILE = os.path.join(IMAGE_DIR, "uploadr.history")
@@ -89,10 +95,10 @@ class APIConstants:
     """ APIConstants class
     """
 
-    base = "http://flickr.com/services/"
+    base = "http://ycpi.api.flickr.com/services/"
     rest   = base + "rest/"
     auth   = base + "auth/"
-    upload = base + "upload/"
+    upload = "http://up.flickr.com/services/upload/"
 
     token = "auth_token"
     secret = "secret"
@@ -138,14 +144,16 @@ class Uploadr:
         #f = api.key + FLICKR[ api.key ] + foo
         return hashlib.md5( f ).hexdigest()
 
-    def urlGen( self , base,data, sig ):
+    def urlGen( self , base,data, sig = None):
         """ urlGen
         """
         foo = base + "?"
         for d in data:
             foo += d + "=" + data[d] + "&"
-        return foo + api.key + "=" + FLICKR[ api.key ] + "&" + api.sig + "=" + sig
-
+        foo += api.key + "=" + FLICKR[ api.key ] 
+        if sig is not None:
+            foo += "&" + api.sig + "=" + sig
+        return foo
 
     def authenticate( self ):
         """ Authenticate user so we can upload images
@@ -311,15 +319,39 @@ class Uploadr:
         if ( not self.checkToken() ):
             self.authenticate()
         self.uploaded = shelve.open( HISTORY_FILE )
+        tickets = {}
+        totalImages = len(newImages)
         for i, image in enumerate( newImages ):
-            success, photoId = self.uploadImage( image )
+            success, ticketId = self.uploadImage( image )
             if success:
-                if args.sets:
-                    self.addPhotoToSet( photoId, args.sets )
+                print("Uploaded %s of %s." % (i+1, totalImages))
                 if args.drip_feed and i != len( newImages )-1:
+                    tickets = self.processTickets(tickets)
                     print("Waiting " + str(DRIP_TIME) + " seconds before next upload")
                     time.sleep( DRIP_TIME )
+                elif (i+1) % TICKET_CHECK_EVERY == 0:
+                    tickets = self.processTickets(tickets)
+                tickets[ticketId] = {"image": image, "photoId": None}
+
+        while tickets:
+            tickets = self.processTickets(tickets)
+            if tickets:
+                time.sleep(5)
+
         self.uploaded.close()
+
+    def processTickets(self, tickets):
+        """ Iterate collected tickets for completed uploads and handle the photo id
+        """
+
+        tickets = self.checkTickets(tickets)
+        for ticketId in [ tid for tid in tickets if tickets[tid]["photoId"] is not None]:
+            ticket = tickets[ticketId]
+            self.logUpload( ticket["photoId"], ticket["image"] )
+            if args.sets:
+                self.addPhotoToSet( ticket["photoId"], args.sets )
+            del tickets[ticketId]
+        return tickets
 
     def grabNewImages( self ):
         """ grabNewImages
@@ -342,7 +374,7 @@ class Uploadr:
         """
 
         success = False
-        photoId = 0
+        ticketId = None
         if ( not self.uploaded.has_key( image ) ):
             print("Uploading " + image + "...")
             try:
@@ -361,7 +393,8 @@ class Uploadr:
                     "tags"          : str( FLICKR["tags"] ),
                     "is_public"     : str( FLICKR["is_public"] ),
                     "is_friend"     : str( FLICKR["is_friend"] ),
-                    "is_family"     : str( FLICKR["is_family"] )
+                    "is_family"     : str( FLICKR["is_family"] ),
+                    "async"         : "1"
                 }
                 sig = self.signCall( d )
                 d[ api.sig ] = sig
@@ -370,16 +403,14 @@ class Uploadr:
                 xml = urllib2.urlopen( url ).read()
                 res = xmltramp.parse(xml)
                 if ( self.isGood( res ) ):
-                    photoId = str( res.photoid )
-                    print("Success.")
-                    self.logUpload( res.photoid, image )
+                    ticketId = str( res.ticketid )
                     success = True
                 else :
                     print("Problem:")
                     self.reportError( res )
             except:
                 print(str(sys.exc_info()))
-        return success, photoId
+        return success, ticketId
 
     def addPhotoToSet( self, photoId, setId ):
         """ add image to a set
@@ -407,6 +438,36 @@ class Uploadr:
         except:
             print(str(sys.exc_info()))
         return success
+
+    def checkTickets( self, tickets):
+        """ Check tickets status and return successful and pending tickets.
+        """
+        if not tickets:
+            return tickets
+
+        ticketIds = ",".join(tickets.keys())
+        print("Checking %s tickets ..." % len(tickets))
+        d = {
+            api.method  : "flickr.photos.upload.checkTickets",
+            "tickets"   : ticketIds,
+        }
+        url = self.urlGen( api.rest, d )
+        try:
+            res = self.getResponse( url )
+            if ( self.isGood( res ) ):
+                for ticket in res.uploader:
+                    completed = "complete" in ticket()
+                    if "invalid" in ticket() or (completed and ticket("complete") == 2):
+                        print("Ticket " + ticket("id") + " failed.")
+                        del tickets[ticket("id")]
+                    elif completed and ticket("complete") == "1":
+                        tickets[ticket("id")]["photoId"] = ticket("photoid")
+            else :
+                print("Problem:")
+                self.reportError( res )
+        except:
+            print(str(sys.exc_info()))
+        return tickets
 
     def logUpload( self, photoID, imageName ):
         """ logUpload
